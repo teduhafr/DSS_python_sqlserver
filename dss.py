@@ -34,23 +34,40 @@ def get_sql_server_engine(server, database, username, password):
 
 def fetch_drill_down_data(table_name, pivot_params, clicked_row_data, clicked_col_name):
     """Fetch raw data for a pivot cell based on selected filters."""
-    filter_desc = {**{col: clicked_row_data[col] for col in pivot_params['rows']}, pivot_params['pivot_col']: clicked_col_name}
-    
+    # Reverse the mapping from the display column name to the actual data value.
+    # The pivot query aliases empty strings as '(Empty)' because empty strings are invalid column names.
+    drill_down_col_value = clicked_col_name
+    if clicked_col_name == '(Empty)':
+        drill_down_col_value = ''
+
+    filter_desc = {
+        **{col: clicked_row_data.get(col) for col in pivot_params['rows']},
+        pivot_params['pivot_col']: drill_down_col_value
+    }
+
+    is_total_row = pivot_params.get('show_col_totals') and pivot_params['rows'] and clicked_row_data.get(pivot_params['rows'][0]) == 'Total'
+    is_total_col = pivot_params.get('show_row_totals') and clicked_col_name == 'Total'
+
     try:
         where_clauses = []
         params = {}
 
-        for col in pivot_params['rows']:
-            param_name = f"param_{col.replace(' ', '_')}"
-            where_clauses.append(f'"{col}" = :{param_name}')
-            params[param_name] = clicked_row_data[col]
+        if not is_total_row:
+            for col in pivot_params['rows']:
+                # Ensure the row data for this column exists before adding filter
+                if col in clicked_row_data and clicked_row_data[col] is not None:
+                    param_name = f"param_{col.replace(' ', '_')}"
+                    where_clauses.append(f'"{col}" = :{param_name}')
+                    params[param_name] = clicked_row_data[col]
 
-        pivot_col = pivot_params['pivot_col']
-        param_name = f"param_{pivot_col.replace(' ', '_')}"
-        where_clauses.append(f'"{pivot_col}" = :{param_name}')
-        params[param_name] = clicked_col_name
+        if not is_total_col:
+            pivot_col = pivot_params['pivot_col']
+            param_name = f"param_{pivot_col.replace(' ', '_')}"
+            where_clauses.append(f'"{pivot_col}" = :{param_name}')
+            params[param_name] = drill_down_col_value
 
-        query_str = f'SELECT * FROM "{table_name}" WHERE {" AND ".join(where_clauses)}'
+        where_str = f' WHERE {" AND ".join(where_clauses)}' if where_clauses else ''
+        query_str = f'SELECT * FROM "{table_name}"{where_str}'
         query = text(query_str)
 
         with st.session_state.engine.connect() as connection:
@@ -122,6 +139,11 @@ if st.session_state.connected:
             value = st.selectbox("Value", options=cols_options, index=2 if len(cols_options) > 2 else 0)
             agg_func = st.selectbox("Aggregation", options=['SUM', 'AVG', 'COUNT', 'MAX', 'MIN'])
 
+            st.markdown("---")
+            st.write("📊 **Totals**")
+            st.checkbox("Show Row Totals (horizontal)", key="show_row_totals")
+            st.checkbox("Show Column Totals (vertical)", key="show_col_totals")
+
     st.title("⚡ Dynamic Pivot Table Generator")
 
     # === Original Data Preview ===
@@ -189,7 +211,7 @@ if st.session_state.connected:
 
     st.markdown("---")
 
-    # === Generate Pivot ===
+    # --- Generate Pivot Table ---
     if st.button("🚀 Generate Pivot Table"):
         if not all([rows, pivot_col, value, st.session_state.table]):
             st.warning("Please select a table, rows, a column, and a value.")
@@ -197,41 +219,103 @@ if st.session_state.connected:
             st.session_state.drill_down_df = None
             st.session_state.drill_down_info = None
             try:
-                st.session_state.pivot_params = {"rows": rows, "pivot_col": pivot_col, "value": value, "agg_func": agg_func}
+                st.session_state.pivot_params = {
+                    "rows": rows,
+                    "pivot_col": pivot_col,
+                    "value": value,
+                    "agg_func": agg_func,
+                    "show_row_totals": st.session_state.get("show_row_totals", False),
+                    "show_col_totals": st.session_state.get("show_col_totals", False)
+                }
                 st.session_state.result_df = None
+
                 with st.session_state.engine.connect() as connection:
+                    # ✅ Get distinct values for pivot column
                     distinct_query = text(f"""
-                        SELECT DISTINCT "{pivot_col}"
+                        SELECT DISTINCT COALESCE(NULLIF(LTRIM(RTRIM(CAST("{pivot_col}" AS VARCHAR(MAX)))), ''), '(Empty)') AS "{pivot_col}"
                         FROM "{st.session_state.table}"
-                        WHERE "{pivot_col}" IS NOT NULL
                         ORDER BY "{pivot_col}";
                     """)
                     result_proxy = connection.execute(distinct_query)
                     distinct_values_df = pd.DataFrame(result_proxy.fetchall(), columns=result_proxy.keys())
-                    pivot_values = [str(val) for val in distinct_values_df[pivot_col].tolist()]
+                    pivot_values = [str(val) for val in distinct_values_df[pivot_col].tolist() if val]
 
                     if not pivot_values:
                         st.warning(f"No distinct values found for column '{pivot_col}'. Pivot cannot be generated.")
                     else:
-                        pivot_in_clause = ", ".join([f'"{v}"' for v in pivot_values])
+                        show_row_totals = st.session_state.pivot_params['show_row_totals']
+                        show_col_totals = st.session_state.pivot_params['show_col_totals']
                         row_cols_str = ", ".join([f'"{r}"' for r in rows])
-                        dynamic_pivot_query_str = f"""
-                            SELECT {row_cols_str}, {pivot_in_clause}
-                            FROM (
-                                SELECT {row_cols_str}, "{pivot_col}", "{value}"
+
+                        # ✅ Build CASE expressions for conditional aggregation
+                        agg_expressions = []
+                        for v in pivot_values:
+                            # Skip empty values that would create invalid column aliases
+                            if not v or v.strip() == '':
+                                continue
+                                
+                            safe_alias = v.strip()
+                            # Replace any quotes in alias and ensure it's not empty
+                            safe_alias = safe_alias.replace('"', '""')
+                            
+                            # Skip if alias would still be empty after cleaning
+                            if not safe_alias:
+                                continue
+                                
+                            alias = f'"{safe_alias}"'
+
+                            # Use original value for CASE condition (replace '(Empty)' with actual empty string)
+                            condition_value = '' if v == '(Empty)' else v
+                            condition_value = condition_value.replace("'", "''")  # escape single quotes
+
+                            # Handle empty string condition properly
+                            if condition_value == '':
+                                condition = f'COALESCE(NULLIF(LTRIM(RTRIM(CAST("{pivot_col}" AS VARCHAR(MAX)))), \'\'), \'(Empty)\') = \'(Empty)\''
+                            else:
+                                condition = f'COALESCE(NULLIF(LTRIM(RTRIM(CAST("{pivot_col}" AS VARCHAR(MAX)))), \'\'), \'(Empty)\') = \'{condition_value}\''
+
+                            expression = f'{agg_func}(CASE WHEN {condition} THEN "{value}" END) AS {alias}'
+                            agg_expressions.append(expression)
+
+                        # ✅ Add row total column if requested
+                        if show_row_totals:
+                            agg_expressions.append(f'{agg_func}("{value}") AS "Total"')
+
+                        if not agg_expressions:
+                            st.warning(f"No valid pivot values found for column '{pivot_col}'. All values appear to be empty or invalid.")
+                        else:
+                            agg_expressions_str = ",\n       ".join(agg_expressions)
+
+                            select_cols = row_cols_str
+                            grouping_logic = f"GROUP BY {row_cols_str}" if rows else ""
+
+                            # ✅ Handle column totals (grand total row)
+                            if show_col_totals and rows:
+                                grouping_logic = f"GROUP BY GROUPING SETS (({row_cols_str}), ())"
+                                coalesce_expressions = []
+                                coalesce_expressions.append(f"COALESCE(CAST(\"{rows[0]}\" AS VARCHAR(MAX)), 'Total') AS \"{rows[0]}\"")
+                                for r in rows[1:]:
+                                    coalesce_expressions.append(f"COALESCE(CAST(\"{r}\" AS VARCHAR(MAX)), '') AS \"{r}\"")
+                                select_cols = ", ".join(coalesce_expressions)
+
+                            # ✅ Build the final SQL
+                            dynamic_pivot_query_str = f"""
+                                SELECT
+                                    {select_cols}{',' if select_cols and agg_expressions_str else ''}
+                                    {agg_expressions_str}
                                 FROM "{st.session_state.table}"
-                            ) AS SourceTable
-                            PIVOT (
-                                {agg_func}("{value}")
-                                FOR "{pivot_col}" IN ({pivot_in_clause})
-                            ) AS PivotTable;
-                        """
-                        st.subheader("Generated T-SQL Query")
-                        st.code(dynamic_pivot_query_str, language="sql")
-                        dynamic_pivot_query = text(dynamic_pivot_query_str)
-                        result_proxy_final = connection.execute(dynamic_pivot_query)
-                        st.session_state.result_df = pd.DataFrame(result_proxy_final.fetchall(), columns=result_proxy_final.keys())
-                        st.success(f"Pivot generated successfully! Found {st.session_state.result_df.shape[0]} rows.")
+                                {grouping_logic};
+                            """
+
+                            # Show generated SQL in UI
+                            st.subheader("Generated T-SQL Query")
+                            st.code(dynamic_pivot_query_str, language="sql")
+
+                            dynamic_pivot_query = text(dynamic_pivot_query_str)
+                            result_proxy_final = connection.execute(dynamic_pivot_query)
+                            st.session_state.result_df = pd.DataFrame(result_proxy_final.fetchall(), columns=result_proxy_final.keys())
+
+                            st.success(f"Pivot generated successfully! Found {st.session_state.result_df.shape[0]} rows.")
             except Exception as e:
                 st.error(f"An error occurred during pivot generation: {e}")
                 st.session_state.result_df = None
