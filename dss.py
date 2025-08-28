@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine, text, inspect
+import plotly.express as px
 
 # --- Page Configuration ---
 st.set_page_config(page_title="Dynamic DB Pivot with User Input", layout="wide")
@@ -234,6 +235,62 @@ if st.session_state.connected:
             df_to_filter = st.session_state.result_df.copy()
 
             st.dataframe(df_to_filter, use_container_width=True)
+
+            # --- Chart Generator ---
+            st.markdown("---")
+            st.subheader("📊 Chart Generator")
+
+            chart_df = df_to_filter.copy()
+            row_cols = st.session_state.pivot_params.get('rows', [])
+
+            # Exclude 'Total' row from charting if it exists, as it can skew visualizations
+            if st.session_state.pivot_params.get('show_col_totals') and row_cols and not chart_df.empty and chart_df[row_cols[0]].iloc[-1] == 'Total':
+                chart_df = chart_df.iloc[:-1]
+
+            if not chart_df.empty and row_cols:
+                chart_type = st.selectbox(
+                    "Select Chart Type",
+                    ["Bar Chart", "Line Chart", "Pie Chart", "Scatter Plot"]
+                )
+
+                if chart_type in ["Bar Chart", "Line Chart", "Scatter Plot"]:
+                    x_axis = st.selectbox("Select X-axis", options=row_cols, key="chart_x_axis")
+
+                    all_value_cols = [c for c in chart_df.columns if c not in row_cols]
+                    y_axis = st.multiselect("Select Y-axis/axes", options=all_value_cols, default=all_value_cols[0] if all_value_cols else None, key="chart_y_axis")
+
+                    if x_axis and y_axis:
+                        try:
+                            title = f"{chart_type}: {', '.join(y_axis)} by {x_axis}"
+                            if chart_type == "Bar Chart":
+                                fig = px.bar(chart_df, x=x_axis, y=y_axis, title=title, barmode='group')
+                            elif chart_type == "Line Chart":
+                                fig = px.line(chart_df, x=x_axis, y=y_axis, title=title)
+                            elif chart_type == "Scatter Plot":
+                                fig = px.scatter(chart_df, x=x_axis, y=y_axis, title=title)
+
+                            st.plotly_chart(fig, use_container_width=True)
+                        except Exception as e:
+                            st.error(f"Could not generate chart: {e}")
+
+                elif chart_type == "Pie Chart":
+                    label_col = st.selectbox("Select Labels", options=row_cols, key="pie_label")
+                    value_cols = [c for c in chart_df.columns if c not in row_cols and pd.api.types.is_numeric_dtype(chart_df[c])]
+                    if value_cols:
+                        value_col = st.selectbox("Select Values", options=value_cols, key="pie_value")
+
+                        if label_col and value_col:
+                            try:
+                                fig = px.pie(chart_df, names=label_col, values=value_col, title=f"Pie Chart: {value_col} by {label_col}")
+                                st.plotly_chart(fig, use_container_width=True)
+                            except Exception as e:
+                                st.error(f"Could not generate chart: {e}")
+                    else:
+                        st.warning("No numeric value columns available for a Pie Chart.")
+            elif not row_cols:
+                 st.info("Select at least one 'Row' in pivot controls to generate a chart.")
+            else:
+                st.info("No data available for charting (the 'Total' row is excluded).")
 
             st.markdown("---")
             st.subheader("🔬 Drill Down")
