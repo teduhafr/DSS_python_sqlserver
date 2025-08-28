@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import urllib.parse
 from sqlalchemy import create_engine, text, inspect
 
 # --- Page Configuration ---
@@ -178,7 +179,9 @@ if st.session_state.connected:
                                     where_clauses = [f'CAST("{col}" AS VARCHAR(MAX)) LIKE :search_term' for col in searchable_cols]
                                     query_string += " WHERE " + " OR ".join(where_clauses)
                                 elif column_to_search != "All Text Columns":
-                                    query_string += f' WHERE CAST("{column_to_search}" AS VARCHAR(MAX)) LIKE :search_term'
+                                    # OPTIMIZATION: Remove CAST for specific column searches to allow index usage.
+                                    # The column is already known to be a text type from the 'searchable_columns' list.
+                                    query_string += f' WHERE "{column_to_search}" LIKE :search_term'
 
                             query = text(query_string)
                             st.session_state.preview_df = pd.read_sql(query, connection, params=params)
@@ -211,6 +214,24 @@ if st.session_state.connected:
 
     st.markdown("---")
 
+    # --- Pre-filter for Pivot ---
+    if st.session_state.table:
+        st.subheader("🔍 Pre-filter Data for Pivot (Recommended)")
+        st.info("Applying a filter here will significantly speed up pivot generation on large tables.")
+        filter_col1, filter_col2 = st.columns([0.4, 0.6])
+        with filter_col1:
+            st.selectbox(
+                "Search in column",
+                options=["All Text Columns"] + st.session_state.get('searchable_columns', []),
+                key="pivot_search_col"
+            )
+        with filter_col2:
+            st.text_input(
+                "Enter search term to filter data before pivoting",
+                key="pivot_search_term",
+                placeholder="Case-insensitive search..."
+            )
+
     # --- Generate Pivot Table ---
     if st.button("🚀 Generate Pivot Table"):
         if not all([rows, pivot_col, value, st.session_state.table]):
@@ -230,92 +251,96 @@ if st.session_state.connected:
                 st.session_state.result_df = None
 
                 with st.session_state.engine.connect() as connection:
-                    # ✅ Get distinct values for pivot column
+                    # Build WHERE clause for both queries from the new UI elements
+                    where_clause = ""
+                    query_params = {}
+                    if st.session_state.pivot_search_term:
+                        query_params['search_term'] = f"%{st.session_state.pivot_search_term}%"
+                        searchable_cols = st.session_state.get('searchable_columns', [])
+                        if st.session_state.pivot_search_col == "All Text Columns" and searchable_cols:
+                            where_clauses_list = [f'CAST("{col}" AS VARCHAR(MAX)) LIKE :search_term' for col in searchable_cols]
+                            where_clause = "WHERE " + " OR ".join(where_clauses_list)
+                        elif st.session_state.pivot_search_col != "All Text Columns":
+                            # OPTIMIZATION: Remove CAST for specific column searches to allow index usage.
+                            # The column is already known to be a text type from the 'searchable_columns' list.
+                            where_clause = f'WHERE "{st.session_state.pivot_search_col}" LIKE :search_term'
+
+                    # ✅ Get distinct values for pivot column (with filter)
                     distinct_query = text(f"""
                         SELECT DISTINCT COALESCE(NULLIF(LTRIM(RTRIM(CAST("{pivot_col}" AS VARCHAR(MAX)))), ''), '(Empty)') AS "{pivot_col}"
                         FROM "{st.session_state.table}"
+                        {where_clause}
                         ORDER BY "{pivot_col}";
                     """)
-                    result_proxy = connection.execute(distinct_query)
+                    result_proxy = connection.execute(distinct_query, query_params)
                     distinct_values_df = pd.DataFrame(result_proxy.fetchall(), columns=result_proxy.keys())
                     pivot_values = [str(val) for val in distinct_values_df[pivot_col].tolist() if val]
 
                     if not pivot_values:
                         st.warning(f"No distinct values found for column '{pivot_col}'. Pivot cannot be generated.")
                     else:
-                        show_row_totals = st.session_state.pivot_params['show_row_totals']
-                        show_col_totals = st.session_state.pivot_params['show_col_totals']
-                        row_cols_str = ", ".join([f'"{r}"' for r in rows])
+                        # --- Optimized Query Generation ---
+                        # This section is refactored for performance and reliability.
 
-                        # ✅ Build CASE expressions for conditional aggregation
+                        # 1. Use a Common Table Expression (CTE) to clean the pivot column ONCE.
+                        # This avoids repeating expensive string operations inside the main aggregation.
+                        all_source_cols = list(set(rows + [pivot_col, value]))
+                        all_source_cols_str = ", ".join([f'"{c}"' for c in all_source_cols])
+                        cleaned_pivot_col_expr = f"COALESCE(NULLIF(LTRIM(RTRIM(CAST(\"{pivot_col}\" AS VARCHAR(MAX)))), ''), '(Empty)')"
+                        cleaned_pivot_col_alias = "_CleanedPivotCol" # Internal alias for the CTE
+
+                        # 2. Build CASE expressions that efficiently use the pre-cleaned column from the CTE.
                         agg_expressions = []
                         for v in pivot_values:
-                            # Skip empty values that would create invalid column aliases
-                            if not v or v.strip() == '':
-                                continue
-                                
-                            safe_alias = v.strip()
-                            # Replace any quotes in alias and ensure it's not empty
-                            safe_alias = safe_alias.replace('"', '""')
-                            
-                            # Skip if alias would still be empty after cleaning
-                            if not safe_alias:
-                                continue
-                                
-                            alias = f'"{safe_alias}"'
-
-                            # Use original value for CASE condition (replace '(Empty)' with actual empty string)
-                            condition_value = '' if v == '(Empty)' else v
-                            condition_value = condition_value.replace("'", "''")  # escape single quotes
-
-                            # Handle empty string condition properly
-                            if condition_value == '':
-                                condition = f'COALESCE(NULLIF(LTRIM(RTRIM(CAST("{pivot_col}" AS VARCHAR(MAX)))), \'\'), \'(Empty)\') = \'(Empty)\''
-                            else:
-                                condition = f'COALESCE(NULLIF(LTRIM(RTRIM(CAST("{pivot_col}" AS VARCHAR(MAX)))), \'\'), \'(Empty)\') = \'{condition_value}\''
-
-                            expression = f'{agg_func}(CASE WHEN {condition} THEN "{value}" END) AS {alias}'
+                            safe_alias = f'"{v.replace('"', '""')}"' # Escape quotes for the final column name
+                            condition_value = v.replace("'", "''") # Escape quotes for the SQL string literal
+                            expression = f'{agg_func}(CASE WHEN "{cleaned_pivot_col_alias}" = \'{condition_value}\' THEN "{value}" END) AS {safe_alias}'
                             agg_expressions.append(expression)
 
-                        # ✅ Add row total column if requested
-                        if show_row_totals:
+                        # 3. Add row totals if requested.
+                        if st.session_state.pivot_params['show_row_totals']:
                             agg_expressions.append(f'{agg_func}("{value}") AS "Total"')
 
-                        if not agg_expressions:
-                            st.warning(f"No valid pivot values found for column '{pivot_col}'. All values appear to be empty or invalid.")
-                        else:
-                            agg_expressions_str = ",\n       ".join(agg_expressions)
+                        agg_expressions_str = ",\n       ".join(agg_expressions)
+                        select_cols = ", ".join([f'"{r}"' for r in rows])
+                        grouping_logic = f"GROUP BY {select_cols}" if rows else ""
 
-                            select_cols = row_cols_str
-                            grouping_logic = f"GROUP BY {row_cols_str}" if rows else ""
+                        # 4. Add column totals (grand total row) if requested.
+                        if st.session_state.pivot_params['show_col_totals'] and rows:
+                            grouping_logic = f"GROUP BY GROUPING SETS (({select_cols}), ())"
+                            coalesce_expressions = [f"COALESCE(CAST(\"{rows[0]}\" AS VARCHAR(MAX)), 'Total') AS \"{rows[0]}\""]
+                            for r in rows[1:]:
+                                coalesce_expressions.append(f"COALESCE(CAST(\"{r}\" AS VARCHAR(MAX)), '') AS \"{r}\"")
+                            select_cols = ", ".join(coalesce_expressions)
 
-                            # ✅ Handle column totals (grand total row)
-                            if show_col_totals and rows:
-                                grouping_logic = f"GROUP BY GROUPING SETS (({row_cols_str}), ())"
-                                coalesce_expressions = []
-                                coalesce_expressions.append(f"COALESCE(CAST(\"{rows[0]}\" AS VARCHAR(MAX)), 'Total') AS \"{rows[0]}\"")
-                                for r in rows[1:]:
-                                    coalesce_expressions.append(f"COALESCE(CAST(\"{r}\" AS VARCHAR(MAX)), '') AS \"{r}\"")
-                                select_cols = ", ".join(coalesce_expressions)
-
-                            # ✅ Build the final SQL
-                            dynamic_pivot_query_str = f"""
+                        # 5. Assemble the final, optimized query.
+                        dynamic_pivot_query_str = f"""
+                            WITH PreppedData AS (
                                 SELECT
-                                    {select_cols}{',' if select_cols and agg_expressions_str else ''}
-                                    {agg_expressions_str}
-                                FROM "{st.session_state.table}"
-                                {grouping_logic};
-                            """
+                                    {all_source_cols_str},
+                                    {cleaned_pivot_col_expr} AS "{cleaned_pivot_col_alias}"
+                                FROM "{st.session_state.table}" {where_clause}
+                            )
+                            SELECT
+                                {select_cols}{',' if select_cols and agg_expressions_str else ''}
+                                {agg_expressions_str}
+                            FROM PreppedData
+                            {grouping_logic};
+                        """
 
-                            # Show generated SQL in UI
-                            st.subheader("Generated T-SQL Query")
-                            st.code(dynamic_pivot_query_str, language="sql")
+                        st.subheader("Generated T-SQL Query")
+                        st.code(dynamic_pivot_query_str, language="sql")
 
+                        # 6. Execute the query robustly using pandas.read_sql.
+                        # This is more reliable than manually fetching results.
+                        with st.spinner("Executing pivot query..."):
                             dynamic_pivot_query = text(dynamic_pivot_query_str)
-                            result_proxy_final = connection.execute(dynamic_pivot_query)
-                            st.session_state.result_df = pd.DataFrame(result_proxy_final.fetchall(), columns=result_proxy_final.keys())
+                            st.session_state.result_df = pd.read_sql(dynamic_pivot_query, connection, params=query_params)
 
-                            st.success(f"Pivot generated successfully! Found {st.session_state.result_df.shape[0]} rows.")
+                        st.success(f"Pivot generated successfully! Found {st.session_state.result_df.shape[0]} rows.")
+                        if st.session_state.result_df.empty:
+                            st.info("The query ran successfully but returned no data.")
+
             except Exception as e:
                 st.error(f"An error occurred during pivot generation: {e}")
                 st.session_state.result_df = None
@@ -352,22 +377,67 @@ if st.session_state.connected:
                             df_to_filter = df_to_filter[df_to_filter[column].between(selected_range[0], selected_range[1])]
                 col_idx += 1
 
-        st.info("💡 Select a row and a numeric column to drill down.")
-
         df_to_filter = df_to_filter.reset_index(drop=True)
-        st.dataframe(df_to_filter, use_container_width=True)
 
-        row_to_drill = st.number_input("Enter row number to drill down (1-based index):", min_value=0, max_value=len(df_to_filter), step=1)
-        if row_to_drill > 0:
-            selected_row_data = df_to_filter.iloc[row_to_drill - 1].to_dict()
-            numeric_cols = [col for col in df_to_filter.columns if pd.api.types.is_numeric_dtype(df_to_filter[col])]
-            if numeric_cols:
-                col_name = st.selectbox("Select a numeric column to drill down:", numeric_cols)
-                if col_name:
-                    with st.spinner(f"Fetching details for column '{col_name}'..."):
+        # --- Handle Drill-Down from URL Query Params ---
+        query_params = st.query_params
+        if "drill_row_idx" in query_params and "drill_col_name" in query_params:
+            try:
+                row_idx = int(query_params.get("drill_row_idx"))
+                col_name_encoded = query_params.get("drill_col_name")
+                col_name = urllib.parse.unquote(col_name_encoded)
+
+                if 0 <= row_idx < len(df_to_filter):
+                    selected_row_data = df_to_filter.iloc[row_idx].to_dict()
+                    
+                    with st.spinner(f"Fetching details for row {row_idx + 1}, column '{col_name}'..."):
                         drill_df, filter_desc = fetch_drill_down_data(st.session_state.table, st.session_state.pivot_params, selected_row_data, col_name)
                         st.session_state.drill_down_df = drill_df
                         st.session_state.drill_down_info = filter_desc
+                else:
+                    st.warning("Drill-down row index is out of bounds. Please try again.")
+
+            except (ValueError, TypeError) as e:
+                st.warning(f"Invalid drill-down parameters in URL: {e}")
+            finally:
+                # Clear params to prevent re-triggering and clean up URL
+                st.query_params.clear()
+                st.rerun()
+
+        st.info("💡 Click a numeric cell in the table below to drill down.")
+
+        # --- Generate and Display Interactive HTML Table ---
+        def dataframe_to_html_with_links(df):
+            html_style = """
+            <style>
+                table { width: 100%; border-collapse: collapse; font-size: 14px; }
+                th, td { border: 1px solid #4F4F4F; padding: 8px; text-align: left; }
+                th { background-color: #262730; color: white; position: sticky; top: 0; z-index: 1;}
+                tr:nth-child(even) { background-color: #262730; }
+                tr:hover td { background-color: #4F4F4F; }
+                a { color: #74C3E8; text-decoration: none; display: block; width: 100%; height: 100%; }
+                a:hover { text-decoration: underline; }
+            </style>
+            """
+            numeric_cols = {col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])}
+            header = "".join(f"<th>{col}</th>" for col in df.columns)
+            body_rows = []
+            for index, row in df.iterrows():
+                row_html = "<tr>"
+                for col_name in df.columns:
+                    val = row[col_name]
+                    if col_name in numeric_cols and pd.notna(val) and val != 0:
+                        encoded_col_name = urllib.parse.quote(col_name)
+                        href = f"?drill_row_idx={index}&drill_col_name={encoded_col_name}"
+                        row_html += f'<td><a href="{href}" target="_self">{val}</a></td>'
+                    else:
+                        row_html += f"<td>{val if pd.notna(val) else ''}</td>"
+                body_rows.append(row_html + "</tr>")
+            body = "".join(body_rows)
+            return f"{html_style}<table><thead><tr>{header}</tr></thead><tbody>{body}</tbody></table>"
+
+        html_table = dataframe_to_html_with_links(df_to_filter)
+        st.markdown(html_table, unsafe_allow_html=True)
 
         if st.session_state.get('drill_down_df') is not None:
             st.markdown("---")
