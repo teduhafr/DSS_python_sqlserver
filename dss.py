@@ -232,21 +232,54 @@ if st.session_state.connected:
             st.subheader("📈 Final Pivot Result")
 
             df_to_filter = st.session_state.result_df.copy()
-            original_df = st.session_state.result_df
 
             st.dataframe(df_to_filter, use_container_width=True)
 
-            row_to_drill = st.number_input("Enter row number to drill down (1-based index):", min_value=0, max_value=len(df_to_filter), step=1)
-            if row_to_drill > 0:
-                selected_row_data = df_to_filter.iloc[row_to_drill - 1].to_dict()
-                numeric_cols = [col for col in df_to_filter.columns if pd.api.types.is_numeric_dtype(df_to_filter[col])]
-                if numeric_cols:
-                    col_name = st.selectbox("Select a numeric column to drill down:", numeric_cols)
-                    if col_name:
-                        with st.spinner(f"Fetching details for column '{col_name}'..."):
-                            drill_df, filter_desc = fetch_drill_down_data(st.session_state.table, st.session_state.pivot_params, selected_row_data, col_name)
-                            st.session_state.drill_down_df = drill_df
-                            st.session_state.drill_down_info = filter_desc
+            st.markdown("---")
+            st.subheader("🔬 Drill Down")
+
+            row_cols = st.session_state.pivot_params.get('rows', [])
+            if row_cols:
+                # Create a display label for each row by concatenating the values of the row columns
+                def create_label(row):
+                    return " - ".join([str(row[c]) for c in row_cols if c in row])
+
+                # Ensure row columns are string type for consistent concatenation
+                df_for_labels = df_to_filter.copy()
+                for col in row_cols:
+                    if col in df_for_labels.columns:
+                        df_for_labels[col] = df_for_labels[col].astype(str)
+
+                row_options = df_for_labels.apply(create_label, axis=1).tolist()
+
+                # Add a placeholder to the options list
+                options_with_placeholder = ["-- Select a row to drill down --"] + row_options
+
+                selected_row_label = st.selectbox(
+                    "Select a row to drill down:",
+                    options=options_with_placeholder,
+                    index=0, # Default to the placeholder
+                    key="drill_down_row_select"
+                )
+
+                # Proceed if a real row is selected
+                if selected_row_label != "-- Select a row to drill down --":
+                    selected_index = row_options.index(selected_row_label)
+                    selected_row_data = df_to_filter.iloc[selected_index].to_dict()
+
+                    numeric_cols = [col for col in df_to_filter.columns if pd.api.types.is_numeric_dtype(df_to_filter[col])]
+
+                    if numeric_cols:
+                        col_name = st.selectbox("Select a numeric column to drill down:", numeric_cols, key="drill_down_col_select")
+                        if col_name:
+                            with st.spinner(f"Fetching details for column '{col_name}'..."):
+                                drill_df, filter_desc = fetch_drill_down_data(st.session_state.table, st.session_state.pivot_params, selected_row_data, col_name)
+                                st.session_state.drill_down_df = drill_df
+                                st.session_state.drill_down_info = filter_desc
+                    else:
+                        st.warning("No numeric columns available in the pivot table to drill down into.")
+            else:
+                st.info("Select at least one 'Row' in the pivot controls to enable drill-down.")
 
             if st.session_state.get('drill_down_df') is not None:
                 st.markdown("---")
