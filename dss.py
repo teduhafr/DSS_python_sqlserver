@@ -18,6 +18,8 @@ if 'connected' not in st.session_state:
     st.session_state.pivot_params = {}
     st.session_state.drill_down_df = None
     st.session_state.drill_down_info = None
+    st.session_state.searchable_columns = []
+    st.session_state.numeric_columns = []
 
 # --- Database Connection Function ---
 def get_sql_server_engine(server, database, username, password):
@@ -122,6 +124,10 @@ if st.session_state.connected:
                     st.session_state.searchable_columns = [
                         c['name'] for c in columns_info
                         if 'char' in str(c['type']).lower() or 'text' in str(c['type']).lower()
+                    ]
+                    st.session_state.numeric_columns = [
+                        c['name'] for c in columns_info
+                        if any(t in str(c['type']).lower() for t in ['int', 'float', 'decimal', 'numeric', 'money'])
                     ]
             except Exception as e:
                 st.error(f"Could not fetch columns for table '{st.session_state.table}': {e}")
@@ -234,63 +240,95 @@ if st.session_state.connected:
 
             df_to_filter = st.session_state.result_df.copy()
 
+            # --- Filter for Pivot Result (Collapsible) ---
+            with st.expander("🔎 Filter Pivot Results", expanded=False):
+                st.write("Apply up to 10 cascading filters. Filters are combined with AND.")
+                num_pivot_filters = 10
+                # Get the list of columns once, as they don't change during filtering
+                available_cols = df_to_filter.columns.tolist()
+
+                for i in range(num_pivot_filters):
+                    # Use columns to layout the filter widgets
+                    cols = st.columns([1, 2])
+                    with cols[0]:
+                        filter_column = st.selectbox(
+                            f"Filter column #{i+1}",
+                            options=['-- Select a column --'] + available_cols,
+                            key=f"pivot_filter_col_{i}"
+                        )
+
+                    if filter_column != '-- Select a column --':
+                        try:
+                            # Get unique values from the *currently filtered* dataframe to make filters dependent
+                            unique_values = sorted(df_to_filter[filter_column].dropna().astype(str).unique())
+
+                            with cols[1]:
+                                selected_values = st.multiselect(
+                                    f"Select values for '{filter_column}'",
+                                    options=unique_values,
+                                    key=f"pivot_filter_values_{i}"
+                                )
+
+                            if selected_values:
+                                df_to_filter = df_to_filter[df_to_filter[filter_column].astype(str).isin(selected_values)]
+                        except Exception as e:
+                            st.warning(f"Could not apply filter on '{filter_column}': {e}")
+
             st.dataframe(df_to_filter, use_container_width=True)
 
-            # --- Chart Generator ---
-            st.markdown("---")
-            st.subheader("📊 Chart Generator")
+            # --- Chart Generator (Collapsible) ---
+            with st.expander("📊 Chart Generator", expanded=False):
+                chart_df = df_to_filter.copy()
+                row_cols = st.session_state.pivot_params.get('rows', [])
 
-            chart_df = df_to_filter.copy()
-            row_cols = st.session_state.pivot_params.get('rows', [])
+                # Exclude 'Total' row from charting if it exists, as it can skew visualizations
+                if st.session_state.pivot_params.get('show_col_totals') and row_cols and not chart_df.empty and chart_df[row_cols[0]].iloc[-1] == 'Total':
+                    chart_df = chart_df.iloc[:-1]
 
-            # Exclude 'Total' row from charting if it exists, as it can skew visualizations
-            if st.session_state.pivot_params.get('show_col_totals') and row_cols and not chart_df.empty and chart_df[row_cols[0]].iloc[-1] == 'Total':
-                chart_df = chart_df.iloc[:-1]
+                if not chart_df.empty and row_cols:
+                    chart_type = st.selectbox(
+                        "Select Chart Type",
+                        ["Bar Chart", "Line Chart", "Pie Chart", "Scatter Plot"]
+                    )
 
-            if not chart_df.empty and row_cols:
-                chart_type = st.selectbox(
-                    "Select Chart Type",
-                    ["Bar Chart", "Line Chart", "Pie Chart", "Scatter Plot"]
-                )
+                    if chart_type in ["Bar Chart", "Line Chart", "Scatter Plot"]:
+                        x_axis = st.selectbox("Select X-axis", options=row_cols, key="chart_x_axis")
 
-                if chart_type in ["Bar Chart", "Line Chart", "Scatter Plot"]:
-                    x_axis = st.selectbox("Select X-axis", options=row_cols, key="chart_x_axis")
+                        all_value_cols = [c for c in chart_df.columns if c not in row_cols]
+                        y_axis = st.multiselect("Select Y-axis/axes", options=all_value_cols, default=all_value_cols[0] if all_value_cols else None, key="chart_y_axis")
 
-                    all_value_cols = [c for c in chart_df.columns if c not in row_cols]
-                    y_axis = st.multiselect("Select Y-axis/axes", options=all_value_cols, default=all_value_cols[0] if all_value_cols else None, key="chart_y_axis")
-
-                    if x_axis and y_axis:
-                        try:
-                            title = f"{chart_type}: {', '.join(y_axis)} by {x_axis}"
-                            if chart_type == "Bar Chart":
-                                fig = px.bar(chart_df, x=x_axis, y=y_axis, title=title, barmode='group')
-                            elif chart_type == "Line Chart":
-                                fig = px.line(chart_df, x=x_axis, y=y_axis, title=title)
-                            elif chart_type == "Scatter Plot":
-                                fig = px.scatter(chart_df, x=x_axis, y=y_axis, title=title)
-
-                            st.plotly_chart(fig, use_container_width=True)
-                        except Exception as e:
-                            st.error(f"Could not generate chart: {e}")
-
-                elif chart_type == "Pie Chart":
-                    label_col = st.selectbox("Select Labels", options=row_cols, key="pie_label")
-                    value_cols = [c for c in chart_df.columns if c not in row_cols and pd.api.types.is_numeric_dtype(chart_df[c])]
-                    if value_cols:
-                        value_col = st.selectbox("Select Values", options=value_cols, key="pie_value")
-
-                        if label_col and value_col:
+                        if x_axis and y_axis:
                             try:
-                                fig = px.pie(chart_df, names=label_col, values=value_col, title=f"Pie Chart: {value_col} by {label_col}")
+                                title = f"{chart_type}: {', '.join(y_axis)} by {x_axis}"
+                                if chart_type == "Bar Chart":
+                                    fig = px.bar(chart_df, x=x_axis, y=y_axis, title=title, barmode='group')
+                                elif chart_type == "Line Chart":
+                                    fig = px.line(chart_df, x=x_axis, y=y_axis, title=title)
+                                elif chart_type == "Scatter Plot":
+                                    fig = px.scatter(chart_df, x=x_axis, y=y_axis, title=title)
+
                                 st.plotly_chart(fig, use_container_width=True)
                             except Exception as e:
                                 st.error(f"Could not generate chart: {e}")
-                    else:
-                        st.warning("No numeric value columns available for a Pie Chart.")
-            elif not row_cols:
-                 st.info("Select at least one 'Row' in pivot controls to generate a chart.")
-            else:
-                st.info("No data available for charting (the 'Total' row is excluded).")
+
+                    elif chart_type == "Pie Chart":
+                        label_col = st.selectbox("Select Labels", options=row_cols, key="pie_label")
+                        value_cols = [c for c in chart_df.columns if c not in row_cols and pd.api.types.is_numeric_dtype(chart_df[c])]
+                        if value_cols:
+                            value_col = st.selectbox("Select Values", options=value_cols, key="pie_value")
+
+                            if label_col and value_col:
+                                try:
+                                    fig = px.pie(chart_df, names=label_col, values=value_col, title=f"Pie Chart: {value_col} by {label_col}")
+                                    st.plotly_chart(fig, use_container_width=True)
+                                except Exception as e:
+                                    st.error(f"Could not generate chart: {e}")
+                        else:
+                            st.warning("No numeric value columns available for a Pie Chart.")
+                elif not row_cols:
+                     st.info("Select at least one 'Row' in pivot controls to generate a chart.")
+                else:
+                    st.info("No data available for charting (the 'Total' row is excluded).")
 
             st.markdown("---")
             st.subheader("🔬 Drill Down")
@@ -360,19 +398,42 @@ if st.session_state.connected:
     with tab2:
         st.title("🔍 Data Explorer")
 
-        if st.session_state.table and 'searchable_columns' in st.session_state and st.session_state.searchable_columns:
+        filterable_columns = st.session_state.get('searchable_columns', []) + st.session_state.get('numeric_columns', [])
+
+        if st.session_state.table and filterable_columns:
             st.subheader(f"Explore and Filter '{st.session_state.table}'")
 
-            st.write("Filter the data by a text column:")
-            filter_col = st.selectbox(
-                "Column to filter",
-                options=st.session_state.searchable_columns,
-                key="data_explorer_filter_col"
-            )
-            filter_val = st.text_input(
-                "Filter value (uses 'contains' search)",
-                key="data_explorer_filter_val"
-            )
+            st.write("Filter data using up to 5 conditions. Filters are combined with AND.")
+
+            filters = []
+            num_filters = 5
+            for i in range(num_filters):
+                cols = st.columns([2, 3])
+                with cols[0]:
+                    col_name = st.selectbox(
+                        f"Column #{i+1}",
+                        options=["-- None --"] + sorted(filterable_columns),
+                        key=f"de_filter_col_{i}"
+                    )
+
+                if col_name != "-- None --":
+                    is_numeric = col_name in st.session_state.get('numeric_columns', [])
+                    with cols[1]:
+                        if is_numeric:
+                            val_cols = st.columns(2)
+                            val1 = val_cols[0].number_input("From", key=f"de_val1_{i}", value=None)
+                            val2 = val_cols[1].number_input("To", key=f"de_val2_{i}", value=None)
+
+                            if val1 is not None and val2 is not None:
+                                filters.append({"column": col_name, "type": "numeric_range", "value": (val1, val2)})
+                            elif val1 is not None:
+                                filters.append({"column": col_name, "type": "numeric_gte", "value": val1})
+                            elif val2 is not None:
+                                filters.append({"column": col_name, "type": "numeric_lte", "value": val2})
+                        else:  # Text column
+                            val = st.text_input("Contains value", key=f"de_filter_val_{i}", placeholder="Type to search...")
+                            if val:
+                                filters.append({"column": col_name, "type": "text_contains", "value": val})
 
             if st.button("Show Data / Apply Filter", key="apply_filter"):
                 with st.spinner("Fetching data..."):
@@ -380,10 +441,28 @@ if st.session_state.connected:
                         with st.session_state.engine.connect() as connection:
                             query_str = f'SELECT * FROM "{st.session_state.table}"'
                             params = {}
-                            if filter_val and filter_col:
-                                # Using LIKE for 'contains' search
-                                query_str += f' WHERE "{filter_col}" LIKE :filter_val'
-                                params['filter_val'] = f'%{filter_val}%'
+                            if filters:
+                                where_clauses = []
+                                for i, f in enumerate(filters):
+                                    col = f['column']
+                                    if f['type'] == 'text_contains':
+                                        param_name = f"param_{i}"
+                                        where_clauses.append(f'"{col}" LIKE :{param_name}')
+                                        params[param_name] = f"%{f['value']}%"
+                                    elif f['type'] == 'numeric_gte':
+                                        param_name = f"param_{i}"
+                                        where_clauses.append(f'"{col}" >= :{param_name}')
+                                        params[param_name] = f['value']
+                                    elif f['type'] == 'numeric_lte':
+                                        param_name = f"param_{i}"
+                                        where_clauses.append(f'"{col}" <= :{param_name}')
+                                        params[param_name] = f['value']
+                                    elif f['type'] == 'numeric_range':
+                                        param_name1, param_name2 = f"param_{i}_a", f"param_{i}_b"
+                                        where_clauses.append(f'"{col}" BETWEEN :{param_name1} AND :{param_name2}')
+                                        params[param_name1], params[param_name2] = f['value']
+
+                                query_str += f' WHERE {" AND ".join(where_clauses)}'
 
                             query = text(query_str)
                             st.session_state.preview_df = pd.read_sql(query, connection, params=params)
@@ -400,7 +479,7 @@ if st.session_state.connected:
             if not st.session_state.table:
                 st.info("Select a table from the sidebar to explore its data.")
             else:
-                st.warning(f"The selected table '{st.session_state.table}' has no text columns available for filtering.")
+                st.warning(f"The selected table '{st.session_state.table}' has no text or numeric columns available for filtering.")
 
 else:
     st.info("Please enter your database credentials and click 'Connect' in the sidebar to begin.")
