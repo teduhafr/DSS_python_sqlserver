@@ -37,12 +37,17 @@ def get_sql_server_engine(server, database, username, password):
 # --- Drill-Down Query ---
 def fetch_drill_down_data(table_name, pivot_params, clicked_row_data, clicked_col_name):
     drill_down_col_value = clicked_col_name
+    pivot_col = pivot_params.get('pivot_col')
+    if not pivot_col:
+        st.warning("Pivot column information not found for drill-down.")
+        return None, None
+
     if clicked_col_name == '(Empty)':
         drill_down_col_value = ''
 
     filter_desc = {
         **{col: clicked_row_data.get(col) for col in pivot_params['rows']},
-        pivot_params['pivot_col']: drill_down_col_value
+        pivot_col: drill_down_col_value
     }
 
     is_total_row = pivot_params.get('show_col_totals') and pivot_params['rows'] and clicked_row_data.get(pivot_params['rows'][0]) == 'Total'
@@ -60,10 +65,9 @@ def fetch_drill_down_data(table_name, pivot_params, clicked_row_data, clicked_co
                     params[param_name] = clicked_row_data[col]
 
         if not is_total_col:
-            pivot_col = pivot_params['pivot_col']
             param_name = f"param_{pivot_col.replace(' ', '_')}"
-            params[param_name] = drill_down_col_value
-            where_clauses.append(f'"{pivot_col}" = :{param_name}')
+            params[param_name] = clicked_col_name # Use the name from the pivot column, e.g., '(Empty)'
+            where_clauses.append(f"COALESCE(NULLIF(LTRIM(RTRIM(\"{pivot_col}\")), ''), '(Empty)') = :{param_name}")
 
         where_str = f' WHERE {" AND ".join(where_clauses)}' if where_clauses else ''
         query_str = f'SELECT * FROM "{table_name}"{where_str}'
@@ -155,83 +159,91 @@ if st.session_state.connected:
         # === Generate Pivot ===
         if st.button("🚀 Generate Pivot Table"):
             if not all([rows, pivot_col, value, st.session_state.table]):
-                st.warning("Please select a table, rows, a column, and a value.")
+                st.warning("Please select a table, at least one row, a column, and a value.")
             else:
-                st.session_state.drill_down_df = None
-                st.session_state.drill_down_info = None
-                try:
-                    st.session_state.pivot_params = {
-                        "rows": rows,
-                        "pivot_col": pivot_col,
-                        "value": value,
-                        "agg_func": agg_func,
-                        "show_row_totals": st.session_state.get("show_row_totals", False),
-                        "show_col_totals": st.session_state.get("show_col_totals", False)
-                    }
-                    st.session_state.result_df = None
+                # --- Aggregation Validation ---
+                is_numeric_agg = agg_func in ['SUM', 'AVG']
+                value_col_is_numeric = value in st.session_state.get('numeric_columns', [])
 
-                    with st.session_state.engine.connect() as connection:
-                        # ✅ Distinct pivot values with empty replaced by (Empty)
-                        distinct_query = text(f"""
-                            SELECT DISTINCT COALESCE(NULLIF(LTRIM(RTRIM("{pivot_col}")), ''), '(Empty)') AS "{pivot_col}"
-                            FROM "{st.session_state.table}"
-                            ORDER BY "{pivot_col}";
-                        """)
-                        result_proxy = connection.execute(distinct_query)
-                        distinct_values_df = pd.DataFrame(result_proxy.fetchall(), columns=result_proxy.keys())
-                        pivot_values = [str(val) for val in distinct_values_df[pivot_col].tolist() if val]
+                if is_numeric_agg and not value_col_is_numeric:
+                    st.error(f"Aggregation '{agg_func}' requires a numeric 'Value' column, but '{value}' is not a numeric column. Please choose a numeric column for the 'Value' field or select a different aggregation like 'COUNT'.")
+                else:
+                    st.session_state.drill_down_df = None
+                    st.session_state.drill_down_info = None
+                    try:
+                        st.session_state.pivot_params = {
+                            "rows": rows,
+                            "pivot_col": pivot_col,
+                            "value": value,
+                            "agg_func": agg_func,
+                            "show_row_totals": st.session_state.get("show_row_totals", False),
+                            "show_col_totals": st.session_state.get("show_col_totals", False)
+                        }
+                        st.session_state.result_df = None
 
-                        if not pivot_values:
-                            st.warning(f"No distinct values found for column '{pivot_col}'. Pivot cannot be generated.")
-                        else:
-                            show_row_totals = st.session_state.pivot_params['show_row_totals']
-                            show_col_totals = st.session_state.pivot_params['show_col_totals']
-                            row_cols_str = ", ".join([f'"{r}"' for r in rows])
+                        with st.spinner("Generating SQL and executing pivot query..."):
+                            with st.session_state.engine.connect() as connection:
+                                # 1. Get distinct values for the pivot column
+                                distinct_query = text(f"""
+                                    SELECT DISTINCT COALESCE(NULLIF(LTRIM(RTRIM("{pivot_col}")), ''), '(Empty)') AS "{pivot_col}"
+                                    FROM "{st.session_state.table}"
+                                    ORDER BY "{pivot_col}";
+                                """)
+                                result_proxy = connection.execute(distinct_query)
+                                distinct_values_df = pd.DataFrame(result_proxy.fetchall(), columns=result_proxy.keys())
+                                pivot_values = [str(val) for val in distinct_values_df[pivot_col].tolist() if val]
 
-                            # ✅ CASE expressions for conditional aggregation
-                            agg_expressions = []
-                            for v in pivot_values:
-                                safe_alias = v.strip().replace('"', '""')
-                                alias = f'"{safe_alias}"'
-                                condition_value = '' if v == '(Empty)' else v
-                                condition_value = condition_value.replace("'", "''")
-                                expression = f'{agg_func}(CASE WHEN "{pivot_col}" = \'{condition_value}\' THEN "{value}" END) AS {alias}'
-                                agg_expressions.append(expression)
+                                if not pivot_values:
+                                    st.warning(f"No distinct values found for column '{pivot_col}'. Pivot cannot be generated.")
+                                    st.stop()
 
-                            if show_row_totals:
-                                agg_expressions.append(f'{agg_func}("{value}") AS "Total"')
+                                # 2. Build the dynamic SQL query with CASE statements
+                                show_row_totals = st.session_state.pivot_params['show_row_totals']
+                                show_col_totals = st.session_state.pivot_params['show_col_totals']
+                                row_cols_str = ", ".join([f'"{r}"' for r in rows])
 
-                            agg_expressions_str = ",\n       ".join(agg_expressions)
-                            select_cols = row_cols_str
-                            grouping_logic = f"GROUP BY {row_cols_str}" if rows else ""
+                                agg_expressions = []
+                                for v in pivot_values:
+                                    safe_alias = v.strip().replace('"', '""')
+                                    alias = f'"{safe_alias}"'
+                                    condition_value = '' if v == '(Empty)' else v
+                                    condition_value = condition_value.replace("'", "''") # Basic SQL injection guard for values
+                                    expression = f'{agg_func}(CASE WHEN "{pivot_col}" = \'{condition_value}\' THEN "{value}" END) AS {alias}'
+                                    agg_expressions.append(expression)
 
-                            if show_col_totals and rows:
-                                grouping_logic = f"GROUP BY GROUPING SETS (({row_cols_str}), ())"
-                                coalesce_expressions = []
-                                coalesce_expressions.append(f"COALESCE(CAST(\"{rows[0]}\" AS VARCHAR(MAX)), 'Total') AS \"{rows[0]}\"")
-                                for r in rows[1:]:
-                                    coalesce_expressions.append(f"COALESCE(CAST(\"{r}\" AS VARCHAR(MAX)), '') AS \"{r}\"")
-                                select_cols = ", ".join(coalesce_expressions)
+                                if show_row_totals:
+                                    agg_expressions.append(f'{agg_func}("{value}") AS "Total"')
 
-                            # ✅ Final query
-                            dynamic_pivot_query_str = f"""
-                                SELECT
-                                    {select_cols}{',' if select_cols and agg_expressions_str else ''}
-                                    {agg_expressions_str}
-                                FROM "{st.session_state.table}"
-                                {grouping_logic};
-                            """
-                            st.subheader("Generated T-SQL Query")
-                            st.code(dynamic_pivot_query_str, language="sql")
+                                agg_expressions_str = ",\n       ".join(agg_expressions)
+                                select_cols = row_cols_str
+                                grouping_logic = f"GROUP BY {row_cols_str}" if rows else ""
 
-                            dynamic_pivot_query = text(dynamic_pivot_query_str)
-                            result_proxy_final = connection.execute(dynamic_pivot_query)
-                            st.session_state.result_df = pd.DataFrame(result_proxy_final.fetchall(), columns=result_proxy_final.keys())
+                                if show_col_totals and rows:
+                                    grouping_logic = f"GROUP BY GROUPING SETS (({row_cols_str}), ())"
+                                    coalesce_expressions = []
+                                    coalesce_expressions.append(f"COALESCE(CAST(\"{rows[0]}\" AS VARCHAR(MAX)), 'Total') AS \"{rows[0]}\"")
+                                    for r in rows[1:]:
+                                        coalesce_expressions.append(f"COALESCE(CAST(\"{r}\" AS VARCHAR(MAX)), '') AS \"{r}\"")
+                                    select_cols = ", ".join(coalesce_expressions)
 
-                            st.success(f"Pivot generated successfully! Found {st.session_state.result_df.shape[0]} rows.")
-                except Exception as e:
-                    st.error(f"An error occurred during pivot generation: {e}")
-                    st.session_state.result_df = None
+                                dynamic_pivot_query_str = f"""
+                                    SELECT
+                                        {select_cols}{',' if select_cols and agg_expressions_str else ''}
+                                        {agg_expressions_str}
+                                    FROM "{st.session_state.table}"
+                                    {grouping_logic};
+                                """
+                                st.subheader("Generated T-SQL Query")
+                                st.code(dynamic_pivot_query_str, language="sql")
+
+                                dynamic_pivot_query = text(dynamic_pivot_query_str)
+                                result_proxy_final = connection.execute(dynamic_pivot_query)
+                                st.session_state.result_df = pd.DataFrame(result_proxy_final.fetchall(), columns=result_proxy_final.keys())
+
+                        st.success(f"Pivot generated successfully! Found {st.session_state.result_df.shape[0]} rows.")
+                    except Exception as e:
+                        st.error(f"An error occurred during pivot generation: {e}")
+                        st.session_state.result_df = None
 
         # --- Display Pivot Result ---
         if st.session_state.result_df is not None and not st.session_state.result_df.empty:
@@ -242,10 +254,23 @@ if st.session_state.connected:
 
             # --- Filter for Pivot Result (Collapsible) ---
             with st.expander("🔎 Filter Pivot Results", expanded=False):
-                st.write("Apply up to 10 cascading filters. Filters are combined with AND.")
+                # --- Column Filter ---
+                row_cols = st.session_state.pivot_params.get('rows', [])
+                value_cols = [c for c in df_to_filter.columns if c not in row_cols]
+
+                selected_display_cols = st.multiselect(
+                    "Show/Hide Pivot Columns",
+                    options=value_cols,
+                    default=value_cols
+                )
+                # Reconstruct the dataframe with the selected columns, keeping row columns at the front
+                df_to_filter = df_to_filter[row_cols + selected_display_cols]
+
+                st.markdown("---")
+                st.write("Apply up to 10 cascading row filters. Filters are combined with AND.")
                 num_pivot_filters = 10
-                # Get the list of columns once, as they don't change during filtering
-                available_cols = df_to_filter.columns.tolist()
+                # The filterable "row columns" are the ones selected by the user
+                available_cols = st.session_state.pivot_params.get('rows', [])
 
                 for i in range(num_pivot_filters):
                     # Use columns to layout the filter widgets
@@ -253,24 +278,41 @@ if st.session_state.connected:
                     with cols[0]:
                         filter_column = st.selectbox(
                             f"Filter column #{i+1}",
-                            options=['-- Select a column --'] + available_cols,
+                            options=['-- Select a row column --'] + available_cols,
                             key=f"pivot_filter_col_{i}"
                         )
 
-                    if filter_column != '-- Select a column --':
+                    if filter_column != '-- Select a row column --':
                         try:
-                            # Get unique values from the *currently filtered* dataframe to make filters dependent
-                            unique_values = sorted(df_to_filter[filter_column].dropna().astype(str).unique())
-
+                            is_numeric = pd.api.types.is_numeric_dtype(df_to_filter[filter_column])
                             with cols[1]:
-                                selected_values = st.multiselect(
-                                    f"Select values for '{filter_column}'",
-                                    options=unique_values,
-                                    key=f"pivot_filter_values_{i}"
-                                )
-
-                            if selected_values:
-                                df_to_filter = df_to_filter[df_to_filter[filter_column].astype(str).isin(selected_values)]
+                                if is_numeric:
+                                    # Drop NA to prevent errors with min/max on columns with mixed types or NaNs
+                                    col_series = df_to_filter[filter_column].dropna()
+                                    if not col_series.empty:
+                                        min_val = float(col_series.min())
+                                        max_val = float(col_series.max())
+                                        if min_val == max_val:
+                                            st.info(f"Column '{filter_column}' has only one numeric value: {min_val}")
+                                        else:
+                                            range_val = st.slider(
+                                                f"Select range for '{filter_column}'",
+                                                min_value=min_val,
+                                                max_value=max_val,
+                                                value=(min_val, max_val),
+                                                key=f"pivot_filter_slider_{i}"
+                                            )
+                                            start_range, end_range = range_val
+                                            # Filter the dataframe based on the slider's range.
+                                            df_to_filter = df_to_filter[df_to_filter[filter_column].between(start_range, end_range)]
+                                    else:
+                                        st.info(f"Column '{filter_column}' contains no numeric data to filter.")
+                                else: # Categorical column
+                                    # Get unique values from the *currently filtered* dataframe to make filters dependent
+                                    unique_values = sorted(df_to_filter[filter_column].dropna().astype(str).unique())
+                                    selected_values = st.multiselect(f"Select values for '{filter_column}'", options=unique_values, key=f"pivot_filter_values_{i}")
+                                    if selected_values:
+                                        df_to_filter = df_to_filter[df_to_filter[filter_column].astype(str).isin(selected_values)]
                         except Exception as e:
                             st.warning(f"Could not apply filter on '{filter_column}': {e}")
 
@@ -278,7 +320,8 @@ if st.session_state.connected:
 
             # --- Chart Generator (Collapsible) ---
             with st.expander("📊 Chart Generator", expanded=False):
-                chart_df = df_to_filter.copy()
+                chart_df = df_to_filter.copy() # The dataframe is already flat
+
                 row_cols = st.session_state.pivot_params.get('rows', [])
 
                 # Exclude 'Total' row from charting if it exists, as it can skew visualizations
@@ -345,7 +388,7 @@ if st.session_state.connected:
                     if col in df_for_labels.columns:
                         df_for_labels[col] = df_for_labels[col].astype(str)
 
-                row_options = df_for_labels.apply(create_label, axis=1).tolist()
+                row_options = df_for_labels.apply(create_label, axis=1).tolist() if not df_for_labels.empty else []
 
                 # Add a placeholder to the options list
                 options_with_placeholder = ["-- Select a row to drill down --"] + row_options
@@ -362,17 +405,23 @@ if st.session_state.connected:
                     selected_index = row_options.index(selected_row_label)
                     selected_row_data = df_to_filter.iloc[selected_index].to_dict()
 
-                    numeric_cols = [col for col in df_to_filter.columns if pd.api.types.is_numeric_dtype(df_to_filter[col])]
+                    # The columns available for drill-down are the value columns of the pivot
+                    row_cols_from_params = st.session_state.pivot_params.get('rows', [])
+
+                    numeric_cols = [
+                        col for col in df_to_filter.columns
+                        if pd.api.types.is_numeric_dtype(df_to_filter[col]) and col not in row_cols_from_params
+                    ]
 
                     if numeric_cols:
-                        col_name = st.selectbox("Select a numeric column to drill down:", numeric_cols, key="drill_down_col_select")
+                        col_name = st.selectbox("Select a value column to drill down:", numeric_cols, key="drill_down_col_select")
                         if col_name:
                             with st.spinner(f"Fetching details for column '{col_name}'..."):
                                 drill_df, filter_desc = fetch_drill_down_data(st.session_state.table, st.session_state.pivot_params, selected_row_data, col_name)
                                 st.session_state.drill_down_df = drill_df
                                 st.session_state.drill_down_info = filter_desc
                     else:
-                        st.warning("No numeric columns available in the pivot table to drill down into.")
+                        st.warning("No numeric value columns available in the pivot table to drill down into.")
             else:
                 st.info("Select at least one 'Row' in the pivot controls to enable drill-down.")
 
