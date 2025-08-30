@@ -2,7 +2,8 @@ import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine, text, inspect
 import plotly.express as px
-
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
+## menggunakan python 3.11, di pc menggunakan conda dss. pakai cmd. kalau power shell error.
 # --- Page Configuration ---
 st.set_page_config(page_title="Dynamic DB Pivot with User Input", layout="wide")
 
@@ -239,6 +240,7 @@ if st.session_state.connected:
                                 dynamic_pivot_query = text(dynamic_pivot_query_str)
                                 result_proxy_final = connection.execute(dynamic_pivot_query)
                                 st.session_state.result_df = pd.DataFrame(result_proxy_final.fetchall(), columns=result_proxy_final.keys())
+                                st.session_state.result_df.columns.name = st.session_state.pivot_params['pivot_col']
 
                         st.success(f"Pivot generated successfully! Found {st.session_state.result_df.shape[0]} rows.")
                     except Exception as e:
@@ -248,7 +250,16 @@ if st.session_state.connected:
         # --- Display Pivot Result ---
         if st.session_state.result_df is not None and not st.session_state.result_df.empty:
             st.markdown("---")
-            st.subheader("📈 Final Pivot Result")
+            
+            # Build dynamic title for the pivot result
+            params = st.session_state.pivot_params
+            agg_func = params.get('agg_func', 'Aggregation')
+            value_col = params.get('value', 'Value')
+            row_cols_str = ", ".join(params.get('rows', []))
+            pivot_col = params.get('pivot_col', 'Column')
+            
+            title = f"📈 {agg_func} of `{value_col}` by `{row_cols_str}` across `{pivot_col}`"
+            st.subheader(title)
 
             df_to_filter = st.session_state.result_df.copy()
 
@@ -316,7 +327,96 @@ if st.session_state.connected:
                         except Exception as e:
                             st.warning(f"Could not apply filter on '{filter_column}': {e}")
 
-            st.dataframe(df_to_filter, use_container_width=True)
+            # --- Interactive AG-Grid Display ---
+            gb = GridOptionsBuilder.from_dataframe(df_to_filter)
+            gb.configure_default_column(
+                resizable=True,
+                filterable=True,
+                sortable=True,
+                editable=False,
+            )
+
+            # Pin the row columns to the left for better navigation
+            for col in row_cols:
+                gb.configure_column(col, pinned='left')
+
+            # Enable single row selection
+            gb.configure_selection(selection_mode='single', use_checkbox=False)
+
+            gridOptions = gb.build()
+
+            grid_response = AgGrid(
+                df_to_filter,
+                gridOptions=gridOptions,
+                data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+                update_mode=GridUpdateMode.SELECTION_CHANGED,
+                fit_columns_on_grid_load=False,
+                height=400,
+                width='100%',
+                key='pivot_grid'
+            )
+
+            # --- Interactive Drill-Down on Row Selection ---
+            selected_rows = grid_response.get("selected_rows")
+
+            if selected_rows is not None and not selected_rows.empty:
+                selected_row_data = selected_rows.iloc[0].to_dict()
+
+                # Create a descriptive label for the selected row
+                row_cols = st.session_state.pivot_params.get('rows', [])
+                row_label_parts = [f"{col}: {selected_row_data.get(col, 'N/A')}" for col in row_cols]
+                row_label = " | ".join(row_label_parts)
+
+                st.markdown("---")
+                st.write(f"#### Select a column to drill down into for row: **{row_label}**")
+
+                # Get numeric columns that are not part of the row definition
+                numeric_cols = [c for c in df_to_filter.columns if pd.api.types.is_numeric_dtype(df_to_filter[c]) and c not in row_cols]
+
+                if not numeric_cols:
+                    st.warning("No numeric data columns available in the current view to drill down into.")
+                else:
+                    with st.form(key='drill_down_form'):
+                        col_name = st.selectbox("Drill-down column:", numeric_cols)
+                        submitted = st.form_submit_button("Drill Down")
+
+                        if submitted:
+                            is_total_col = col_name == 'Total'
+                            is_total_row = selected_row_data.get(row_cols[0] if row_cols else None) == 'Total'
+
+                            if not is_total_col and not is_total_row:
+                                with st.spinner(f"Fetching details for '{col_name}'..."):
+                                    drill_df, filter_desc = fetch_drill_down_data(
+                                        st.session_state.table,
+                                        st.session_state.pivot_params,
+                                        selected_row_data,
+                                        col_name
+                                    )
+                                    st.session_state.drill_down_df = drill_df
+                                    st.session_state.drill_down_info = filter_desc
+                                    st.rerun()
+                            else:
+                                st.toast("Drill-down is not available for 'Total' rows or columns.")
+
+            # --- Drill-Down Display ---
+            if st.session_state.get('drill_down_df') is not None:
+                st.markdown("---")
+                st.subheader("🔬 Drill-Down Details")
+
+                if st.session_state.drill_down_info:
+                    st.write("Showing raw data for:")
+                    st.json(st.session_state.drill_down_info)
+
+                if not st.session_state.drill_down_df.empty:
+                    st.dataframe(st.session_state.drill_down_df, use_container_width=True)
+                    st.info(f"Displaying {len(st.session_state.drill_down_df)} raw data rows.")
+                else:
+                    st.warning("No underlying data found for the selected cell.")
+
+                if st.button("Hide Details"):
+                    st.session_state.drill_down_df = None
+                    st.session_state.drill_down_info = None
+                    st.rerun()
 
             # --- Chart Generator (Collapsible) ---
             with st.expander("📊 Chart Generator", expanded=False):
@@ -372,77 +472,6 @@ if st.session_state.connected:
                      st.info("Select at least one 'Row' in pivot controls to generate a chart.")
                 else:
                     st.info("No data available for charting (the 'Total' row is excluded).")
-
-            st.markdown("---")
-            st.subheader("🔬 Drill Down")
-
-            row_cols = st.session_state.pivot_params.get('rows', [])
-            if row_cols:
-                # Create a display label for each row by concatenating the values of the row columns
-                def create_label(row):
-                    return " - ".join([str(row[c]) for c in row_cols if c in row])
-
-                # Ensure row columns are string type for consistent concatenation
-                df_for_labels = df_to_filter.copy()
-                for col in row_cols:
-                    if col in df_for_labels.columns:
-                        df_for_labels[col] = df_for_labels[col].astype(str)
-
-                row_options = df_for_labels.apply(create_label, axis=1).tolist() if not df_for_labels.empty else []
-
-                # Add a placeholder to the options list
-                options_with_placeholder = ["-- Select a row to drill down --"] + row_options
-
-                selected_row_label = st.selectbox(
-                    "Select a row to drill down:",
-                    options=options_with_placeholder,
-                    index=0, # Default to the placeholder
-                    key="drill_down_row_select"
-                )
-
-                # Proceed if a real row is selected
-                if selected_row_label != "-- Select a row to drill down --":
-                    selected_index = row_options.index(selected_row_label)
-                    selected_row_data = df_to_filter.iloc[selected_index].to_dict()
-
-                    # The columns available for drill-down are the value columns of the pivot
-                    row_cols_from_params = st.session_state.pivot_params.get('rows', [])
-
-                    numeric_cols = [
-                        col for col in df_to_filter.columns
-                        if pd.api.types.is_numeric_dtype(df_to_filter[col]) and col not in row_cols_from_params
-                    ]
-
-                    if numeric_cols:
-                        col_name = st.selectbox("Select a value column to drill down:", numeric_cols, key="drill_down_col_select")
-                        if col_name:
-                            with st.spinner(f"Fetching details for column '{col_name}'..."):
-                                drill_df, filter_desc = fetch_drill_down_data(st.session_state.table, st.session_state.pivot_params, selected_row_data, col_name)
-                                st.session_state.drill_down_df = drill_df
-                                st.session_state.drill_down_info = filter_desc
-                    else:
-                        st.warning("No numeric value columns available in the pivot table to drill down into.")
-            else:
-                st.info("Select at least one 'Row' in the pivot controls to enable drill-down.")
-
-            if st.session_state.get('drill_down_df') is not None:
-                st.markdown("---")
-                st.subheader("🔬 Drill-Down Details")
-
-                if st.session_state.drill_down_info:
-                    st.write("Showing raw data for:")
-                    st.json(st.session_state.drill_down_info)
-
-                if not st.session_state.drill_down_df.empty:
-                    st.dataframe(st.session_state.drill_down_df, use_container_width=True)
-                    st.info(f"Displaying {len(st.session_state.drill_down_df)} raw data rows.")
-                else:
-                    st.warning("No underlying data found for the selected cell.")
-
-                if st.button("Hide Details"):
-                    st.session_state.drill_down_df = None
-                    st.session_state.drill_down_info = None
-                    st.rerun()
 
     with tab2:
         st.title("🔍 Data Explorer")
