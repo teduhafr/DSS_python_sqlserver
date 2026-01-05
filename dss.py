@@ -85,6 +85,7 @@ def fetch_drill_down_data(table_name, pivot_params, clicked_row_data, clicked_co
 # --- Sidebar: Database Connection ---
 with st.sidebar:
     st.title("🔗 Database Connection")
+    st.subheader("For SQL Server")
     server = st.text_input("Server/Host", placeholder="your_server.database.windows.net")
     database = st.text_input("Database", placeholder="your_database_name")
     username = st.text_input("Username", placeholder="your_username")
