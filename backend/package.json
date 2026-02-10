@@ -1,0 +1,27 @@
+{
+    "name": "dss-backend",
+    "version": "1.0.0",
+    "description": "DSS Application Backend with Express and SQL Server",
+    "main": "server.js",
+    "type": "module",
+    "scripts": {
+        "start": "node server.js",
+        "dev": "node --watch server.js"
+    },
+    "keywords": [
+        "dss",
+        "sql-server",
+        "pivot",
+        "express"
+    ],
+    "author": "",
+    "license": "ISC",
+    "dependencies": {
+        "express": "^4.18.2",
+        "mssql": "^10.0.1",
+        "cors": "^2.8.5",
+        "swagger-jsdoc": "^6.2.8",
+        "swagger-ui-express": "^5.0.0",
+        "dotenv": "^16.3.1"
+    }
+}
