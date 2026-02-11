@@ -4,6 +4,7 @@ import PivotControls from './components/PivotControls';
 import PivotGrid from './components/PivotGrid';
 import DrillDown from './components/DrillDown';
 import DataExplorer from './components/DataExplorer';
+import ChartGenerator from './components/ChartGenerator';
 import { pivotAPI, connectionAPI } from './services/api';
 
 function App() {
@@ -154,11 +155,18 @@ function App() {
                     )}
 
                     {pivotData && pivotParams && (
-                      <PivotGrid
-                        data={pivotData}
-                        pivotParams={pivotParams}
-                        onCellClick={handleCellClick}
-                      />
+                      <>
+                        <PivotGrid
+                          data={pivotData}
+                          pivotParams={pivotParams}
+                          onCellClick={handleCellClick}
+                        />
+                        
+                        <ChartGenerator 
+                          data={pivotData}
+                          pivotParams={pivotParams}
+                        />
+                      </>
                     )}
 
                     {drillDownData && (

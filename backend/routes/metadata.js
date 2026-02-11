@@ -1,5 +1,5 @@
 import express from 'express';
-import { testConnection, closeConnection } from '../config/database.js';
+import { testConnection, closeConnection, testPostgresConnection, executePostgresQuery, closePostgresConnection } from '../config/database.js';
 
 const router = express.Router();
 
@@ -48,46 +48,81 @@ const router = express.Router();
  */
 router.post('/columns/:tableName', async (req, res) => {
     const { tableName } = req.params;
-    const { server, database, username, password, port } = req.body;
+    const { server, database, username, password, port, dbType } = req.body;
 
-    if (!port) {
-        port = 1433; // Default SQL Server port
-    }
-
-    let pool;
+    let client;
     try {
-        pool = await testConnection({ server, database, username, password, port });
+        if (dbType === 'postgres') {
+            const pgPort = parseInt(port) || 5432;
+            client = await testPostgresConnection({ host: server, database, username, password, port: pgPort });
 
-        // Get sample data to determine columns
-        const sampleResult = await pool.request().query(`SELECT TOP 1 * FROM [${tableName}]`);
-        const columns = Object.keys(sampleResult.recordset[0] || {});
+            const query = `
+                SELECT column_name, data_type 
+                FROM information_schema.columns 
+                WHERE table_name = '${tableName}'
+                ORDER BY ordinal_position;
+            `;
 
-        // Get column types from schema
-        const columnInfoResult = await pool.request().query(`
-      SELECT COLUMN_NAME, DATA_TYPE 
-      FROM INFORMATION_SCHEMA.COLUMNS 
-      WHERE TABLE_NAME = '${tableName}'
-    `);
+            const result = await executePostgresQuery(client, query);
 
-        const searchableColumns = [];
-        const numericColumns = [];
+            const columns = [];
+            const searchableColumns = [];
+            const numericColumns = [];
 
-        columnInfoResult.recordset.forEach(col => {
-            const dataType = col.DATA_TYPE.toLowerCase();
+            result.rows.forEach(col => {
+                columns.push(col.column_name);
+                const dataType = col.data_type.toLowerCase();
 
-            if (dataType.includes('char') || dataType.includes('text')) {
-                searchableColumns.push(col.COLUMN_NAME);
-            }
+                if (dataType.includes('char') || dataType.includes('text')) {
+                    searchableColumns.push(col.column_name);
+                }
 
-            if (['int', 'float', 'decimal', 'numeric', 'money', 'bigint', 'smallint', 'tinyint', 'real'].some(t => dataType.includes(t))) {
-                numericColumns.push(col.COLUMN_NAME);
-            }
-        });
+                if (['int', 'float', 'decimal', 'numeric', 'money', 'bigint', 'smallint', 'tinyint', 'real', 'double precision'].some(t => dataType.includes(t))) {
+                    numericColumns.push(col.column_name);
+                }
+            });
 
-        await closeConnection(pool);
-        res.json({ columns, searchableColumns, numericColumns });
+            await closePostgresConnection(client);
+            res.json({ columns, searchableColumns, numericColumns });
+
+        } else {
+            // Default to MSSQL
+            const mssqlPort = parseInt(port) || 1433;
+            client = await testConnection({ server, database, username, password, port: mssqlPort });
+
+            // Get column information from schema
+            const columnInfoResult = await client.request().query(`
+                SELECT COLUMN_NAME, DATA_TYPE 
+                FROM INFORMATION_SCHEMA.COLUMNS 
+                WHERE TABLE_NAME = '${tableName}'
+                ORDER BY ORDINAL_POSITION
+            `);
+
+            const columns = [];
+            const searchableColumns = [];
+            const numericColumns = [];
+
+            columnInfoResult.recordset.forEach(col => {
+                columns.push(col.COLUMN_NAME);
+                const dataType = col.DATA_TYPE.toLowerCase();
+
+                if (dataType.includes('char') || dataType.includes('text')) {
+                    searchableColumns.push(col.COLUMN_NAME);
+                }
+
+                if (['int', 'float', 'decimal', 'numeric', 'money', 'bigint', 'smallint', 'tinyint', 'real'].some(t => dataType.includes(t))) {
+                    numericColumns.push(col.COLUMN_NAME);
+                }
+            });
+
+            await closeConnection(client);
+            res.json({ columns, searchableColumns, numericColumns });
+        }
     } catch (error) {
-        if (pool) await closeConnection(pool);
+        if (client) {
+            if (dbType === 'postgres') await closePostgresConnection(client);
+            else await closeConnection(client);
+        }
         res.status(500).json({ error: error.message });
     }
 });
